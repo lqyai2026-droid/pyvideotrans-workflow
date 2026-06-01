@@ -1,0 +1,219 @@
+#!/bin/bash
+# pvt-test: 完整环境检查
+PASS=0
+FAIL=0
+
+check() {
+    echo -n "  [$1] "
+    if eval "$2" > /dev/null 2>&1; then
+        echo "✓ PASS"; ((PASS++))
+    else
+        echo "✗ FAIL"; ((FAIL++))
+    fi
+}
+
+info() { echo "$1"; }
+
+CONFIG_FILE="/data/pyvideotrans-workflow/config/job_config.yaml"
+TRANSLATION_MODEL=$(awk '/selected_model:/ {print $2; exit}' "$CONFIG_FILE" 2>/dev/null)
+if [ -z "$TRANSLATION_MODEL" ]; then
+    TRANSLATION_MODEL="hy-mt2-translate:latest"
+fi
+
+echo "========================================"
+echo " pyVideoTrans 字幕流水线 - 环境检测"
+echo "========================================"
+echo
+
+info "1. 存储检查"
+df -h /data | tail -1
+echo "  输入目录: $(du -sh /data/pyvideotrans-workflow/input 2>/dev/null | cut -f1 || echo '空')"
+echo "  输出目录: $(du -sh /data/pyvideotrans-workflow/output 2>/dev/null | cut -f1 || echo '空')"
+echo
+
+info "2. 目录权限检查"
+for d in input output work done error logs status config scripts app; do
+    DIR="/data/pyvideotrans-workflow/$d"
+    if [ -d "$DIR" ] && [ -r "$DIR" ] && [ -w "$DIR" ]; then
+        echo "  $DIR ✓"
+    else
+        echo "  $DIR ✗ (权限不足)"; ((FAIL++))
+    fi
+done
+echo
+
+info "3. 关键文件检查"
+for f in config/job_config.yaml scripts/pvt_subtitle_batch.py; do
+    if [ -f "/data/pyvideotrans-workflow/$f" ]; then
+        echo "  $f ✓"
+    else
+        echo "  $f ✗ 缺失"; ((FAIL++))
+    fi
+done
+echo
+
+info "4. ffmpeg 检查"
+ffmpeg -version 2>&1 | head -1
+echo
+
+info "5. uv 检查"
+uv --version
+echo
+
+info "6. pyVideoTrans CLI 检查"
+cd /data/pyvideotrans-workflow/app/pyvideotrans
+if uv run --offline --no-sync cli.py --help > /dev/null 2>&1; then
+    echo "  pyVideoTrans CLI ✓"
+else
+    echo "  pyVideoTrans CLI ✗"; ((FAIL++))
+fi
+echo
+
+info "7. NVIDIA GPU 检查"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader 2>/dev/null || echo "  nvidia-smi 不可用"
+echo
+
+info "8. Ollama API 检查"
+curl -s http://127.0.0.1:11434/v1/models 2>/dev/null | python3 -c "import sys,json; data=json.load(sys.stdin); [print(f'  模型: {m[\"id\"]}') for m in data.get('data',[])]" || echo "  Ollama API 不可访问"
+echo
+
+info "9. 当前翻译模型可用性"
+echo "  当前配置模型: $TRANSLATION_MODEL"
+OLLAMA_OK=$(curl -s http://127.0.0.1:11434/v1/models 2>/dev/null | MODEL_NAME="$TRANSLATION_MODEL" python3 -c "import os,sys,json; data=json.load(sys.stdin); model=os.environ.get('MODEL_NAME'); print('yes' if any(m.get('id')==model for m in data.get('data',[])) else 'no')" 2>/dev/null)
+if [ "$OLLAMA_OK" = "yes" ]; then
+    echo "  $TRANSLATION_MODEL ✓ 在 Ollama 中"
+else
+    echo "  $TRANSLATION_MODEL ✗ 未找到"; ((FAIL++))
+fi
+echo
+
+info "10. Samba smbd 状态"
+if systemctl is-active smbd > /dev/null 2>&1; then
+    echo "  smbd 服务: 运行中 ✓"
+else
+    echo "  smbd 服务: 未运行 ✗"
+fi
+testparm -s 2>/dev/null | grep -E "^\[pvt-" | while read line; do echo "  共享: $line"; done
+echo
+
+info "11. pvt-in/pvt-out 写入测试"
+TESTFILE="/data/pyvideotrans-workflow/input/.pvt_test_write"
+touch "$TESTFILE" 2>/dev/null && echo "  pvt-in 写入 ✓" && rm -f "$TESTFILE" || echo "  pvt-in 写入 ✗"
+TESTFILE="/data/pyvideotrans-workflow/output/.pvt_test_write"
+touch "$TESTFILE" 2>/dev/null && echo "  pvt-out 写入 ✓" && rm -f "$TESTFILE" || echo "  pvt-out 写入 ✗"
+echo
+
+info "12. 命令封装检查"
+for cmd in pvt-start pvt-status pvt-logs pvt-test; do
+    if [ -f "/home/lqyai/.local/bin/$cmd" ]; then
+        echo "  $cmd ✓"
+    else
+        echo "  $cmd ✗ 未找到"; ((FAIL++))
+    fi
+done
+echo
+
+info "13. STS 小样本翻译测试（必须保存到 output）"
+STS_OUTPUT="/data/pyvideotrans-workflow/output/generated_test.translated.zh-cn.srt"
+SRT_TEST=$(cat << 'SRTEOF'
+1
+00:00:01,000 --> 00:00:03,000
+こんにちは、今日はいい天気ですね。
+
+2
+00:00:03,500 --> 00:00:06,000
+This is a subtitle translation test.
+SRTEOF
+)
+echo "$SRT_TEST" | STS_OUTPUT="$STS_OUTPUT" TRANSLATION_MODEL="$TRANSLATION_MODEL" python3 -c "
+import sys, json, urllib.request, os, re
+
+srt = sys.stdin.read()
+out_path = os.environ.get('STS_OUTPUT', '/data/pyvideotrans-workflow/output/generated_test.translated.zh-cn.srt')
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+payload = {
+    'model': os.environ.get('TRANSLATION_MODEL', 'hy-mt2-translate:latest'),
+    'messages': [{'role': 'user', 'content': f'''你是一个专业的字幕翻译助手。请将以下字幕从日语/英语翻译成中文。
+
+【强制要求】
+1. 只输出翻译后的字幕文本，不要输出任何解释、思考过程、markdown格式
+2. 严格保持原始字幕的编号、时间轴和分段
+3. 时间轴格式: 00:00:00,000 --> 00:00:00,000（保持不变）
+4. 每条字幕块之间用一个空行分隔
+5. 只翻译字幕正文，不翻译时间轴和编号
+
+【待翻译字幕】
+{srt}
+
+【翻译结果】'''}],
+    'temperature': 0.1,
+    'stream': False
+}
+try:
+    req = urllib.request.Request(
+        'http://127.0.0.1:11434/v1/chat/completions',
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json', 'Authorization': 'Bearer 1234'},
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = json.loads(resp.read())
+        content = result['choices'][0]['message']['content']
+        if '-->' in content:
+            # 验证是否保留了编号（数字开头行）和时间轴
+            has_number = bool(re.search(r'^\d+$', content, re.MULTILINE))
+            has_timeline = bool(re.search(r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}', content))
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(content.strip() + '\n')
+            print('TRANSLATE_OK')
+            print(f'  翻译输出: ✓ 保留SRT格式 ({len(content)} 字符)')
+            print(f'  文件已保存: {out_path}')
+        else:
+            print('TRANSLATE_FAIL')
+            print('  翻译输出: ? 格式异常')
+            print(content[:400])
+except Exception as e:
+    print('TRANSLATE_FAIL')
+    print(f'  翻译测试: ✗ {e}')
+" 2>&1; PYRET=$?
+# 用 PIPESTATUS[0] 取 pipeline 中 python3 的退出码
+PYCODE=${PIPESTATUS[0]}
+if [ "$PYCODE" -eq 0 ] && [ -s "$STS_OUTPUT" ]; then
+    # 检查编号和时间轴是否保留
+    # 用 -w 精确匹配纯数字行（编号）和标准时间轴格式，避免被 grep 自己的输出干扰
+    HAS_NUMBER=$(grep -Ec '^[[:digit:]]+$' "$STS_OUTPUT" 2>/dev/null || echo 0)
+    HAS_TIMELINE=$(grep -Ec '^[[:digit:]]{2}:[[:digit:]]{2}:[[:digit:]]{2},[[:digit:]]{3} --> [[:digit:]]{2}:[[:digit:]]{2}:[[:digit:]]{2},[[:digit:]]{3}$' "$STS_OUTPUT" 2>/dev/null || echo 0)
+    # 再次兜底：如果结果是空或非数字，强置为 0
+    HAS_NUMBER=$(echo "$HAS_NUMBER" | grep -E '^[[:digit:]]+$' || echo 0)
+    HAS_TIMELINE=$(echo "$HAS_TIMELINE" | grep -E '^[[:digit:]]+$' || echo 0)
+    if [ "$HAS_NUMBER" -gt 0 ] 2>/dev/null && [ "$HAS_TIMELINE" -gt 0 ] 2>/dev/null; then
+        echo "  编号保留: ✓ ($HAS_NUMBER 条)"
+        echo "  时间轴保留: ✓ ($HAS_TIMELINE 条)"
+        ((PASS++))
+    else
+        echo "  编号保留: ✗ (检测到: '$HAS_NUMBER' 条)"
+        echo "  时间轴保留: ✗ (检测到: '$HAS_TIMELINE' 条)"
+        ((FAIL++))
+    fi
+elif [ "$PYCODE" -ne 0 ]; then
+    echo "  翻译调用: ✗ Python异常 (退出码 $PYCODE)"
+    ((FAIL++))
+else
+    echo "  输出文件: ✗ 未生成或为空"
+    ((FAIL++))
+fi
+echo
+
+info "14. input 目录视频检查"
+VIDEO_COUNT=$(find /data/pyvideotrans-workflow/input -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.mov" -o -name "*.avi" -o -name "*.webm" -o -name "*.mpeg" -o -name "*.mpg" -o -name "*.ogg" -o -name "*.mts" -o -name "*.ts" -o -name "*.wmv" \) ! -name "._*" 2>/dev/null | wc -l)
+if [ "$VIDEO_COUNT" -gt 0 ]; then
+    echo "  input 目录有 $VIDEO_COUNT 个视频，可以运行 pvt-start"
+else
+    echo "  input 目录暂无视频文件，等待用户上传"
+fi
+echo
+
+echo "========================================"
+echo " 检测完成: $PASS 通过, $FAIL 失败"
+echo "========================================"

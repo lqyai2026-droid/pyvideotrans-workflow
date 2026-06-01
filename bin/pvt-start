@@ -1,0 +1,24 @@
+#!/bin/bash
+# pvt-start - 启动 PVT 字幕工作流
+# 用法: pvt-start [--help|-h|help]
+#   无参数    启动字幕批处理流水线
+#   --help    显示本帮助信息（不启动任何任务）
+
+# 检查帮助参数
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help|help)
+            echo "用法: pvt-start [选项]"
+            echo ""
+            echo "启动 PVT 字幕批处理流水线（视频 -> STT -> 翻译）。"
+            echo ""
+            echo "选项:"
+            echo "  -h, --help, help   显示本帮助信息并退出"
+            echo ""
+            echo "无参数时启动字幕处理流水线。"
+            exit 0
+            ;;
+    esac
+done
+
+cd /data/pyvideotrans-workflow && python3 scripts/pvt_subtitle_batch.py --run

@@ -1,0 +1,32 @@
+# Privacy / large runtime data
+input/
+output/
+work/
+done/
+error/
+status/
+models/
+app/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.webm
+*.mpeg
+*.mpg
+*.ogg
+*.mts
+*.ts
+*.srt.before_jpfix.srt
+*_old_bad_*/
+
+# Python/cache/logs
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.DS_Store
+._*
+.venv/
+.env

@@ -1,0 +1,53 @@
+input:
+  dir: /data/pyvideotrans-workflow/input
+output:
+  dir: /data/pyvideotrans-workflow/output
+  do_not_merge_video: true
+  do_not_tts: true
+  do_not_vtv: true
+  save_original_srt: true
+  save_translated_srt: true
+  save_txt_copy: true
+runtime:
+  file_extensions:
+  - .mp4
+  - .mov
+  - .avi
+  - .mkv
+  - .webm
+  - .mpeg
+  - .mpg
+  - .ogg
+  - .mts
+  - .ts
+  - .wmv
+  max_parallel_jobs: 1
+stt:
+  detect_language: ja
+  enable_diariz: false
+  engine: faster-whisper
+  fallback_model_name: medium
+  fix_punc: true
+  model_name: large-v3
+  recogn_type: 0
+  remove_noise: false
+  use_cuda: auto
+task_mode: subtitle_only
+translation:
+  api_base_candidates:
+  - http://127.0.0.1:11434/v1
+  - http://localhost:11434/v1
+  api_key: '1234'
+  chunk_lines: 5
+  engine: ollama
+  max_retries: 3
+  pyvideotrans_translate_type: 8
+  selected_model: qwen2.5:7b-instruct
+  send_full_subtitle: false
+  source_language_code: auto
+  target_language_code: 繁体中文
+  temperature: 0.1
+work:
+  dir: /data/pyvideotrans-workflow/work
+  done_dir: /data/pyvideotrans-workflow/done
+  error_dir: /data/pyvideotrans-workflow/error
