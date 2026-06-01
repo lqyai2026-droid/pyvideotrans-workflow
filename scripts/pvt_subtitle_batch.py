@@ -555,6 +555,32 @@ def contains_refusal_text(content: str) -> bool:
     return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in REFUSAL_PATTERNS)
 
 
+def contains_kana_residue(srt_text: str) -> bool:
+    """
+    检测 SRT 正文中是否残留明显日文假名。
+    策略：提取每块正文字符串（去掉编号行和时间轴行），
+    对纯文本行用 [ぁ-んァ-ン]{2,} 检测。
+    匹配到连续2个及以上假名字符即为阳性。
+    """
+    timeline_re = re.compile(
+        r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$"
+    )
+    blocks = re.split(r"\n\n+", srt_text.strip())
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        body_lines = []
+        for ln in lines:
+            if re.match(r"^\d+$", ln):
+                continue  # 编号行
+            if timeline_re.match(ln):
+                continue  # 时间轴行
+            body_lines.append(ln)
+        for body in body_lines:
+            if re.search(r"[ぁ-んァ-ン]{2,}", body):
+                return True
+    return False
+
+
 def translate_srt_via_ollama(
     original_srt: str,
     source_lang: str,
@@ -679,6 +705,20 @@ def translate_srt_via_ollama(
                                 forced_restored, allow_bad_chunk=True, start_num=start_num
                             )
                             if valid_final:
+                                # 强制回套修复后仍需通过日文假名残留检查
+                                if contains_kana_residue(forced_restored):
+                                    kana_warn = (
+                                        f"Chunk {chunk_num} 重试耗尽，回套修复后仍有日文假名残留 "
+                                        f"(尝试 {attempt+1}/{max_retries})"
+                                    )
+                                    logger.warning(kana_warn)
+                                    if attempt < max_retries - 1:
+                                        time.sleep(2 ** attempt)
+                                        continue  # 重试
+                                    else:
+                                        return None, (
+                                            f"Chunk {chunk_num} 翻译后仍有日文假名残留，已停止输出"
+                                        )
                                 logger.warning(
                                     f"  Chunk {chunk_num} 重试耗尽，但回套修复成功（块数={source_count}）"
                                 )
@@ -688,6 +728,21 @@ def translate_srt_via_ollama(
                         return None, (
                             f"Chunk {chunk_num} 翻译输出不是合法 SRT: "
                             f"{bad_chunks[0][1]}"
+                        )
+
+                # 日文假名残留质量门：只检查翻译结果，不检查原文
+                if contains_kana_residue(translated_chunk):
+                    kana_warning = (
+                        f"Chunk {chunk_num} 翻译后仍有日文假名残留 "
+                        f"(尝试 {attempt+1}/{max_retries})"
+                    )
+                    logger.warning(kana_warning)
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue  # 重试
+                    else:
+                        return None, (
+                            f"Chunk {chunk_num} 翻译后仍有日文假名残留，已停止输出"
                         )
 
                 translated_blocks.append(translated_chunk)
