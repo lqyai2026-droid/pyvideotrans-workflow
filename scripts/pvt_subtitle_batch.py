@@ -762,7 +762,14 @@ def run_stt(video_path: Path, job_work_dir: Path, config: Dict[str, Any],
             capture_output=True,
             text=True,
             timeout=3600,  # 1小时超时
-            env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_ENDPOINT": ""},
+            env={
+                **os.environ,
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_ENDPOINT": "",
+                "HF_HOME": str(PVT_APP / "models"),
+                "MODELSCOPE_CACHE": str(PVT_APP / "models"),
+            },
         )
 
         if result.returncode != 0:
@@ -1038,21 +1045,31 @@ def process_video(video_path: Path, config: Dict[str, Any]) -> bool:
             # large-v3 离线失败时降级到 medium
             if "snapshot_download" in stt_err or "remote repo cannot be accessed" in stt_err:
                 fallback_model = config["stt"].get("fallback_model_name", "medium")
+                # 确认 fallback 模型在本地可用，避免空降级
+                fallback_local_dir = PVT_APP / "models" / f"models--Systran--faster-whisper-{fallback_model.replace('/', '--')}"
+                if not fallback_local_dir.exists() or not any(fallback_local_dir.glob("*.bin")):
+                    raise Exception(f"STT 降级失败: fallback 模型 {fallback_model} 本地不存在，无法使用")
                 logger.warning(f"  large-v3 离线加载失败，尝试降级到 {fallback_model}...")
                 logger.info(f"  [降级] large-v3 → {fallback_model} 写入日志")
                 job_status["manifest_notes"].append(f"[降级] large-v3 → {fallback_model}")
 
-                # 修改配置使用 fallback 模型重试
-                config["stt"]["model_name"] = fallback_model
-                job_status["stt_model"] = fallback_model
-                original_srt_path, detected_lang, stt_err = run_stt(work_video, job_work_dir, config, stt_start_time)
+                # 保存原始模型名，fallback 结束后恢复（不污染后续任务）
+                original_model_name = config["stt"]["model_name"]
+                try:
+                    # 修改配置使用 fallback 模型重试
+                    config["stt"]["model_name"] = fallback_model
+                    job_status["stt_model"] = fallback_model
+                    original_srt_path, detected_lang, stt_err = run_stt(work_video, job_work_dir, config, stt_start_time)
 
-                if not stt_err:
-                    job_status["model_fallback"] = True
-                    job_status["manifest_notes"].append(f"[降级成功] 使用模型: {fallback_model}")
-                    logger.info(f"  降级模型 {fallback_model} STT 成功")
-                else:
-                    raise Exception(f"STT 降级失败: {stt_err}")
+                    if not stt_err:
+                        job_status["model_fallback"] = True
+                        job_status["manifest_notes"].append(f"[降级成功] 使用模型: {fallback_model}")
+                        logger.info(f"  降级模型 {fallback_model} STT 成功")
+                    else:
+                        raise Exception(f"STT 降级失败: {stt_err}")
+                finally:
+                    # 恢复原始模型名，防止污染后续任务
+                    config["stt"]["model_name"] = original_model_name
             else:
                 raise Exception(f"STT 失败: {stt_err}")
 
