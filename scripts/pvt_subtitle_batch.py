@@ -581,6 +581,74 @@ def contains_kana_residue(srt_text: str) -> bool:
     return False
 
 
+def repair_kana_residue_chunk(
+    chunk_srt: str,
+    translated_chunk: str,
+    api_base: str,
+    model_name: str,
+    target_lang: str = "简体中文",
+    temperature: float = 0.1,
+) -> Tuple[Optional[str], str]:
+    """
+    修补翻译结果中的日文假名残留。
+    调用 Ollama API，让模型只修复翻译正文中的假名残留，
+    严格保持编号、时间轴、块数。
+    返回 (修补后SRT, 错误信息)
+    """
+    repair_prompt = f"""以下是一段字幕的原文和翻译结果。翻译结果中残留了日文假名，需要你修复。
+
+要求：
+1. 只输出修复后的 SRT 字幕，不输出任何解释、思考过程或额外说明
+2. 严格保持原始字幕的编号、时间轴和块数（一个都不能多，一个都不能少）
+3. 时间轴格式: 00:00:00,000 --> 00:00:00,000（原样保留）
+4. 每条字幕块之间用一个空行分隔
+5. 只修复翻译正文中的日文假名残留，不要改动编号和时间轴
+6. 修复后的字幕正文必须全部是中文，不能包含任何日文假名（ひらがな、片假名）
+
+原文（SRT，只读编号和时间轴，正文仅供参考）：
+{chunk_srt}
+
+翻译结果（需要修复假名残留，只改正文）：
+{translated_chunk}
+"""
+
+    try:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": repair_prompt,
+                }
+            ],
+            "temperature": temperature,
+            "stream": False,
+        }
+
+        req = urllib.request.Request(
+            f"{api_base}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer 1234",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode())
+            repaired = result["choices"][0]["message"]["content"]
+
+        repaired = clean_llm_commentary(repaired)
+        repaired = normalize_srt_timestamps(repaired)
+        repaired = restore_srt_structure(chunk_srt, repaired)
+
+        return repaired, ""
+
+    except Exception as e:
+        return None, f"修补 API 异常: {e}"
+
+
 def translate_srt_via_ollama(
     original_srt: str,
     source_lang: str,
@@ -708,10 +776,39 @@ def translate_srt_via_ollama(
                                 # 强制回套修复后仍需通过日文假名残留检查
                                 if contains_kana_residue(forced_restored):
                                     kana_warn = (
-                                        f"Chunk {chunk_num} 重试耗尽，回套修复后仍有日文假名残留 "
+                                        f"Chunk {chunk_num} 回套修复后仍有日文假名残留，尝试修补 "
                                         f"(尝试 {attempt+1}/{max_retries})"
                                     )
                                     logger.warning(kana_warn)
+                                    # 先尝试修补，不直接重试
+                                    repaired, repair_err = repair_kana_residue_chunk(
+                                        chunk_srt,
+                                        forced_restored,
+                                        api_base,
+                                        model_name,
+                                        target_lang,
+                                        temperature,
+                                    )
+                                    if repaired is not None:
+                                        repaired_valid, _, _ = validate_srt(
+                                            repaired, allow_bad_chunk=True, start_num=start_num
+                                        )
+                                        if repaired_valid and not contains_kana_residue(repaired):
+                                            logger.warning(
+                                                f"  Chunk {chunk_num} 修补成功，假名残留已清除"
+                                            )
+                                            translated_blocks.append(repaired)
+                                            logger.info(f"  Chunk {chunk_num}/{total_chunks} 翻译成功（修补修复）")
+                                            break
+                                        else:
+                                            logger.warning(
+                                                f"  Chunk {chunk_num} 修补后仍不通过验证，继续重试逻辑"
+                                            )
+                                    else:
+                                        logger.warning(
+                                            f"  Chunk {chunk_num} 修补失败: {repair_err}"
+                                        )
+                                    # 修补不成功，按原 retry 逻辑重试原 chunk
                                     if attempt < max_retries - 1:
                                         time.sleep(2 ** attempt)
                                         continue  # 重试
@@ -730,13 +827,41 @@ def translate_srt_via_ollama(
                             f"{bad_chunks[0][1]}"
                         )
 
-                # 日文假名残留质量门：只检查翻译结果，不检查原文
+                # 日文假名残留质量门：先尝试修补，修补成功则继续；修补失败再重试
                 if contains_kana_residue(translated_chunk):
                     kana_warning = (
-                        f"Chunk {chunk_num} 翻译后仍有日文假名残留 "
+                        f"Chunk {chunk_num} 翻译后仍有日文假名残留，尝试修补 "
                         f"(尝试 {attempt+1}/{max_retries})"
                     )
                     logger.warning(kana_warning)
+                    repaired, repair_err = repair_kana_residue_chunk(
+                        chunk_srt,
+                        translated_chunk,
+                        api_base,
+                        model_name,
+                        target_lang,
+                        temperature,
+                    )
+                    if repaired is not None:
+                        repaired_valid, _, _ = validate_srt(
+                            repaired, allow_bad_chunk=True, start_num=start_num
+                        )
+                        if repaired_valid and not contains_kana_residue(repaired):
+                            logger.warning(
+                                f"  Chunk {chunk_num} 修补成功，假名残留已清除"
+                            )
+                            translated_blocks.append(repaired)
+                            logger.info(f"  Chunk {chunk_num}/{total_chunks} 翻译成功（修补修复）")
+                            break
+                        else:
+                            logger.warning(
+                                f"  Chunk {chunk_num} 修补后仍不通过验证，继续重试逻辑"
+                            )
+                    else:
+                        logger.warning(
+                            f"  Chunk {chunk_num} 修补失败: {repair_err}"
+                        )
+                    # 修补不成功，按原 retry 逻辑重试原 chunk
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)
                         continue  # 重试
