@@ -117,8 +117,31 @@ def wait_for_stable_file(filepath: Path, min_interval: float = 3.0, max_wait: fl
     return False
 
 
+def make_safe_name(name: str) -> str:
+    """
+    生成真正安全的短文件名：只含 ASCII 字母、数字、下划线、连字符。
+    保留扩展名；去掉空格、中文、点号前缀、多余点号、超长名称。
+    用于 pyVideoTrans STT 工作副本。
+    """
+    stem = Path(name).stem
+    ext = Path(name).suffix.lower()
+
+    # 去掉所有非 ASCII 字母/数字/下划线/连字符的字符
+    safe_stem = re.sub(r"[^a-zA-Z0-9_\-]", "", stem)
+
+    # 太长则截断（避免超长路径问题）
+    if len(safe_stem) > 60:
+        safe_stem = safe_stem[:60]
+
+    # 如果 stem 全是无效字符导致为空，用默认名
+    if not safe_stem:
+        safe_stem = "input_video"
+
+    return safe_stem + ext
+
+
 def safe_filename(name: str) -> str:
-    """替换不安全字符为下划线"""
+    """替换不安全字符为下划线（保留兼容，用于日志展示）"""
     keepcharacters = (" ", ".", "_", "-")
     return "".join(c if c.isalnum() or c in keepcharacters else "_" for c in name)
 
@@ -1173,14 +1196,11 @@ def process_video(video_path: Path, config: Dict[str, Any]) -> bool:
             raise Exception("文件大小在等待期间未稳定，可能还在上传中")
         logger.info(f"  文件稳定，大小: {video_path.stat().st_size} bytes")
 
-        # 复制视频到 work 目录（安全文件名）
-        safe_name = safe_filename(video_name)
+        # 复制视频到 work 目录（真正安全的短文件名）
+        safe_name = make_safe_name(video_name)
         work_video = job_work_dir / safe_name
-        if safe_name != video_name or " " in video_name:
-            shutil.copy2(video_path, work_video)
-            logger.info(f"  视频复制为安全文件名: {work_video}")
-        else:
-            work_video = video_path
+        shutil.copy2(video_path, work_video)
+        logger.info(f"  视频复制为安全文件名: {work_video}")
 
         # 检测 Ollama 模型
         update_status(job_id, "checking_ollama", "检查 Ollama 模型...", extra=job_status)
